@@ -20,6 +20,10 @@ from doc_extractor.contracts_c import (
     RunMetadata,
 )
 from doc_extractor.extractor import SchemaGuidedExtractor, find_evidence_for_value
+from doc_extractor.field_assembly import (
+    assemble_canonical_envelope,
+    assemble_field_entry,
+)
 from doc_extractor.validation_rules import (
     normalize_date_to_iso,
     normalize_phone_number,
@@ -67,8 +71,15 @@ class ModuleCPipeline:
                 ),
             )
 
-        # Run schema-constrained extraction (FR-EXT-001, FR-EXT-002)
-        extracted_data = self.extractor.extract(payload)
+        # Run schema-constrained extraction (FR-EXT-001, FR-EXT-002, SCH-007)
+        if hasattr(self.extractor, "extract_with_provenance"):
+            extraction_result = self.extractor.extract_with_provenance(payload)
+            extracted_data = extraction_result.payload
+            execution_provenance = extraction_result.provenance
+        else:
+            extracted_data = self.extractor.extract(payload)
+            execution_provenance = getattr(self.extractor, "last_provenance", None)
+
         doc_type = payload.classification.document_type.value
 
         fields_envelope: Dict[str, ExtractedField] = {}
@@ -81,35 +92,21 @@ class ModuleCPipeline:
         elif doc_type == "DOC-03":
             self._process_doc_03(extracted_data, payload, fields_envelope, flags)
 
-        # Document-Level Status Gating (FR-CNF-003, GR-027)
-        # IF all fields have review_required == False AND all validations pass AND no flags -> auto_approved
-        # IF any field has review_required == True OR validation == "failed" OR flags exist -> needs_review
-        requires_review = any(
-            f.review_required or f.validation == "failed" for f in fields_envelope.values()
-        ) or len(flags) > 0
-
-        if payload.status == "failed":
-            final_status: Literal["processing", "auto_approved", "needs_review", "reviewed", "rejected", "failed"] = "failed"
-        else:
-            final_status = "needs_review" if requires_review else "auto_approved"
-
-        return CanonicalExtractionEnvelope(
+        return assemble_canonical_envelope(
             document_id=payload.document_id,
-            document_metadata=DocumentMetadata(
-                document_type=payload.classification.document_type.value,
-                schema_id=payload.classification.schema_id or doc_type,
-                schema_version=payload.classification.schema_version or "1.0.0",
-                classification_confidence=payload.classification.classification_confidence,
-                status=final_status,
-                page_count=len(payload.pages),
-            ),
+            document_type=payload.classification.document_type.value,
+            schema_id=payload.classification.schema_id or doc_type,
+            schema_version=payload.classification.schema_version or "1.0.0",
+            classification_confidence=payload.classification.classification_confidence,
+            page_count=len(payload.pages),
             fields=fields_envelope,
             flags=flags,
-            run=RunMetadata(
-                run_id=payload.run_id,
-                model_versions={"parser": payload.parser_model_name, "extractor": self.extractor.model_name},
-                prompt_version="1.0.0",
-            ),
+            run_id=payload.run_id,
+            parser_model_name=payload.parser_model_name,
+            extractor_model_name=getattr(self.extractor, "model_name", "unknown"),
+            prompt_version="1.0.0",
+            provenance=execution_provenance,
+            payload_status=payload.status,
         )
 
     def _process_doc_01(
@@ -329,68 +326,14 @@ class ModuleCPipeline:
         """
         Helper to create a validated ExtractedField with evidence grounding,
         null-if-absent logic (FR-EXT-003, GR-003), and calibrated confidence (FR-CNF-001).
+        Delegates to shared assemble_field_entry service.
         """
-        # Null-if-Absent Logic (FR-EXT-003, GR-003)
-        if value is None:
-            return ExtractedField(
-                value=None,
-                confidence=0.0,
-                null_reason="absent",
-                review_required=required,
-                validation="failed" if required else "not_applicable",
-                evidence=None,
-            )
-
-        # Evidence Grounding (FR-EXT-004, GR-002)
-        evidence_dict = find_evidence_for_value(value, payload.pages)
-        evidence_model: Optional[EvidenceSnippet] = None
-        optical_conf = 1.0
-
-        if evidence_dict:
-            evidence_model = EvidenceSnippet(
-                page=evidence_dict["page"],
-                bbox=tuple(evidence_dict["bbox"]),
-                text=evidence_dict["text"],
-            )
-            optical_conf = evidence_dict.get("ocr_confidence", 1.0)
-        elif not isinstance(value, bool):
-            # GR-002 / FR-EXT-004: No non-null value without pixel-grounded evidence.
-            # Flag EVIDENCE_MISSING, force value: null, null_reason: absent, review_required: true
-            flags.append(FlagItem(
-                code="EVIDENCE_MISSING",
-                message=f"No grounded visual evidence found in document for field '{field_name}'.",
-                fields=[field_name],
-            ))
-            return ExtractedField(
-                value=None,
-                confidence=0.0,
-                null_reason="absent",
-                review_required=True,
-                validation="failed",
-                evidence=None,
-            )
-
-        # Validation status
-        has_validation_failed = (error is not None)
-        validation_status: Literal["passed", "failed"] = "failed" if has_validation_failed else "passed"
-
-        # Calibrated Confidence Math (FR-CNF-001)
-        confidence = calculate_calibrated_confidence(
-            ocr_confidence=optical_conf,
-            model_confidence=1.0,
-            validation_passed=not has_validation_failed,
-            has_evidence=True,
-        )
-
-        # Threshold & Review Flagging (FR-CNF-002, GR-009)
-        # If confidence < 0.75 or validation failed -> review_required = True
-        review_required = has_validation_failed or (confidence < 0.75) or (required and value is None)
-
-        return ExtractedField(
+        return assemble_field_entry(
+            field_name=field_name,
             value=value,
-            confidence=confidence,
-            null_reason=None,
-            review_required=review_required,
-            validation=validation_status,
-            evidence=evidence_model,
+            pages=payload.pages,
+            flags=flags,
+            error=error,
+            required=required,
+            strict_boolean_evidence=False,  # preserve existing static pipeline compatibility
         )

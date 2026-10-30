@@ -208,3 +208,28 @@ class StorageError(DocumentExtractorError):
             details=details,
         )
 
+
+class LLMExecutionError(DocumentExtractorError):
+    """
+    Raised when LLM grammar-constrained extraction fails and fallback is disabled (SCH-007).
+    Signals provider network failure, invalid model response, or schema validation failure.
+    """
+
+    def __init__(
+        self,
+        message: str = "LLM extraction execution failed under strict no-fallback policy.",
+        model_name: Optional[str] = None,
+        request_id: Optional[str] = None,
+        code: str = "LLM_EXECUTION_FAILED",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        merged = dict(details or {})
+        if model_name:
+            merged["model_name"] = model_name
+        super().__init__(
+            message=message,
+            code=code,
+            request_id=request_id,
+            details=merged,
+        )
+        self.model_name = model_name

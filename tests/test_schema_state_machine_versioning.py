@@ -823,3 +823,135 @@ def test_rollback_reconciles_retired_status_and_rejects_draft():
         SchemaStateMachine.validate_rollback_transition(SchemaStatus.DRAFT)
     with pytest.raises(InvalidStateTransitionError):
         SchemaStateMachine.validate_rollback_transition(SchemaStatus.TESTING)
+
+
+# ============================================================================
+# 8. TASK-4.3 Stage 2B: Isolated Test Schema Binding Tests
+# ============================================================================
+
+def test_bind_test_schema_success_when_testing():
+    """Verify that a schema in TESTING status binds successfully for test harness execution."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.DRAFT)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+
+    # Transition from draft to testing
+    manager.transition_status("tenant_alpha", "DOC-01", 1, SchemaStatus.TESTING, actor="author_alice")
+
+    # 1. Bind using integer version
+    snapshot = manager.bind_test_schema("tenant_alpha", "DOC-01", 1)
+    assert snapshot.schema_id == "DOC-01"
+    assert snapshot.version == 1
+    assert snapshot.status == SchemaStatus.TESTING
+    assert snapshot.tenant_id == "tenant_alpha"
+
+    # 2. Bind using string representation ("1" or "1.0.0")
+    snapshot_str = manager.bind_test_schema("tenant_alpha", "DOC-01", "1")
+    assert snapshot_str.version == 1
+    snapshot_semver = manager.bind_test_schema("tenant_alpha", "DOC-01", "1.0.0")
+    assert snapshot_semver.version == 1
+
+
+def test_bind_test_schema_rejects_draft_status():
+    """Verify that schemas in DRAFT status are rejected for test harness execution."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.DRAFT)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+
+    with pytest.raises(InvalidStateTransitionError) as exc_info:
+        manager.bind_test_schema("tenant_alpha", "DOC-01", 1)
+    assert "draft" in exc_info.value.message.lower()
+    assert exc_info.value.from_status == SchemaStatus.DRAFT
+    assert exc_info.value.to_status == SchemaStatus.TESTING
+
+
+def test_bind_test_schema_rejects_retired_status():
+    """Verify that schemas in RETIRED status are rejected for test harness execution."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.DRAFT)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+    manager.transition_status("tenant_alpha", "DOC-01", 1, SchemaStatus.TESTING, actor="author_alice")
+    manager.transition_status("tenant_alpha", "DOC-01", 1, SchemaStatus.RETIRED, actor="author_alice")
+
+    with pytest.raises(InvalidStateTransitionError) as exc_info:
+        manager.bind_test_schema("tenant_alpha", "DOC-01", 1)
+    assert "retired" in exc_info.value.message.lower()
+    assert exc_info.value.from_status == SchemaStatus.RETIRED
+
+
+def test_bind_test_schema_rejects_approved_status():
+    """Verify that schemas in APPROVED status are rejected by test harness binding (strictly for TESTING)."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.APPROVED)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+
+    with pytest.raises(InvalidStateTransitionError) as exc_info:
+        manager.bind_test_schema("tenant_alpha", "DOC-01", 1)
+    assert "approved" in exc_info.value.message.lower()
+    assert exc_info.value.from_status == SchemaStatus.APPROVED
+
+
+def test_bind_test_schema_cross_tenant_isolation():
+    """Verify tenant isolation: tenant_beta cannot bind tenant_alpha's testing schema."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.DRAFT)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+    manager.transition_status("tenant_alpha", "DOC-01", 1, SchemaStatus.TESTING, actor="author_alice")
+
+    # Cross-tenant lookup fails with SchemaNotFoundError
+    with pytest.raises(SchemaNotFoundError) as exc_info:
+        manager.bind_test_schema("tenant_beta", "DOC-01", 1)
+    assert exc_info.value.tenant_id == "tenant_beta"
+    assert exc_info.value.schema_id == "DOC-01"
+
+    # Empty tenant ID fails with TenantAccessError
+    with pytest.raises(TenantAccessError):
+        manager.bind_test_schema("", "DOC-01", 1)
+
+
+def test_bind_test_schema_wrong_version_rejected():
+    """Verify that non-existent schema versions raise SchemaNotFoundError."""
+    manager = SchemaLifecycleManager()
+    schema_def = make_test_schema(status=SchemaStatus.DRAFT)
+    manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+    manager.transition_status("tenant_alpha", "DOC-01", 1, SchemaStatus.TESTING, actor="author_alice")
+
+    with pytest.raises(SchemaNotFoundError) as exc_info:
+        manager.bind_test_schema("tenant_alpha", "DOC-01", 2)
+    assert exc_info.value.version == 2
+
+
+def test_bind_test_schema_does_not_modify_production_active_pointer_or_status():
+    """
+    CRITICAL ISOLATION REQUIREMENT:
+    Test binding must NEVER alter the active production version pointer or schema status.
+    """
+    manager = SchemaLifecycleManager()
+    # v1 is approved and active in production
+    v1_def = make_test_schema(version=1, status=SchemaStatus.APPROVED)
+    manager.create_schema("tenant_alpha", v1_def, author="alice")
+    assert manager.resolve_active_schema("tenant_alpha", "DOC-01").version == 1
+
+    # v2 is created as draft and transitioned to testing
+    v2_def = make_test_schema(version=2, status=SchemaStatus.DRAFT)
+    manager.create_version("tenant_alpha", "DOC-01", v2_def, author="bob")
+    manager.transition_status("tenant_alpha", "DOC-01", 2, SchemaStatus.TESTING, actor="bob")
+
+    # Bind v2 for testing
+    test_snapshot = manager.bind_test_schema("tenant_alpha", "DOC-01", 2)
+    assert test_snapshot.version == 2
+    assert test_snapshot.status == SchemaStatus.TESTING
+
+    # Invariants must hold:
+    # 1. v2 status is STILL testing (not modified)
+    stored_v2 = manager.repository.get_snapshot("DOC-01", 2, "tenant_alpha")
+    assert stored_v2.status == SchemaStatus.TESTING
+
+    # 2. Production active pointer is STILL v1 (unaltered)
+    active_prod = manager.resolve_active_schema("tenant_alpha", "DOC-01")
+    assert active_prod.version == 1
+    assert active_prod.status == SchemaStatus.APPROVED
+
+    # 3. Production binding v2 is STILL rejected with SchemaNotApprovedError
+    with pytest.raises(SchemaNotApprovedError):
+        manager.bind_production_schema("tenant_alpha", "DOC-01", version=2)

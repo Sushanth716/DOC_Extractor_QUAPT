@@ -62,6 +62,10 @@ from schema_lifecycle.adapters import (
     LifecycleSchemaRegistryAdapter,
     SchemaVersionAdapter,
 )
+from schema_lifecycle.compiler import (
+    CompiledFieldMetadata,
+    DynamicSchemaCompiler,
+)
 
 __all__ = [
     # Enums
@@ -87,6 +91,9 @@ __all__ = [
     # Adapters
     "SchemaVersionAdapter",
     "LifecycleSchemaRegistryAdapter",
+    # Compiler
+    "DynamicSchemaCompiler",
+    "CompiledFieldMetadata",
     # Serializer
     "safe_load_yaml",
     "safe_dump_yaml",

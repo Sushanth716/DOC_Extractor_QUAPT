@@ -7,18 +7,20 @@ Strictly adheres to PRD §6.1, §6.2, §7.1, SCH-004, and SCH-006.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from schema_lifecycle.diff import compute_schema_diff
 from schema_lifecycle.enums import SchemaStatus
 from schema_lifecycle.events import LifecycleEvent, LifecycleEventType
 from schema_lifecycle.exceptions import (
+    InvalidStateTransitionError,
     SchemaNotApprovedError,
     SchemaNotFoundError,
     SchemaRollbackError,
     SchemaVersionError,
     TenantAccessError,
 )
+from schema_lifecycle.adapters import SchemaVersionAdapter
 from schema_lifecycle.metamodel import SchemaDefinition
 from schema_lifecycle.repository import (
     InMemorySchemaRepository,
@@ -442,6 +444,64 @@ class SchemaLifecycleManager:
                 ),
                 schema_id=schema_id,
                 version=version,
+            )
+
+        return snapshot
+
+    def bind_test_schema(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: Union[int, str],
+    ) -> SchemaSnapshot:
+        """
+        Binds an exact schema version strictly for evaluation harness execution (SCH-007, US-DOCX-010).
+
+        Requirements:
+        1. Resolve using exact tenant_id, schema_id, and canonical integer version.
+        2. Permit harness binding ONLY when status is SchemaStatus.TESTING.
+        3. Reject DRAFT, RETIRED, APPROVED, missing and cross-tenant schemas with appropriate existing exceptions:
+           - Missing / cross-tenant -> SchemaNotFoundError
+           - Blank tenant -> TenantAccessError
+           - Non-TESTING status -> InvalidStateTransitionError
+        4. Return the exact immutable SchemaSnapshot.
+        5. Never modify the active production version pointer.
+        6. Never change schema lifecycle status during binding.
+        7. Keep bind_production_schema() and resolve_active_schema() behavior unchanged.
+        """
+        if not tenant_id or not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise TenantAccessError("Tenant identifier must be a non-empty string for test schema binding.")
+
+        if not schema_id or not isinstance(schema_id, str) or not schema_id.strip():
+            raise ValueError("schema_id must be a non-empty string.")
+
+        canonical_version = SchemaVersionAdapter.to_canonical(version)
+
+        snapshot = self.repository.get_snapshot(schema_id.strip(), canonical_version, tenant_id.strip())
+        if snapshot is None:
+            raise SchemaNotFoundError(
+                f"Schema '{schema_id}' version {canonical_version} not found for tenant '{tenant_id}'.",
+                schema_id=schema_id,
+                version=canonical_version,
+                tenant_id=tenant_id,
+            )
+
+        if snapshot.status != SchemaStatus.TESTING:
+            raise InvalidStateTransitionError(
+                message=(
+                    f"Attempted to bind schema '{schema_id}' version {canonical_version} with status "
+                    f"'{snapshot.status.value}' for test harness execution. Only schemas in 'testing' "
+                    "status may be bound for evaluation (SCH-007, US-DOCX-010)."
+                ),
+                from_status=snapshot.status,
+                to_status=SchemaStatus.TESTING,
+                schema_id=schema_id,
+                version=canonical_version,
+                code="INVALID_STATE_TRANSITION",
+                details={
+                    "status": snapshot.status.value,
+                    "allowed_status": SchemaStatus.TESTING.value,
+                },
             )
 
         return snapshot

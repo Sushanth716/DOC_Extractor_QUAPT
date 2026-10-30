@@ -3,8 +3,62 @@ Module C Contracts: Canonical Extraction Envelope and Field Output Schema.
 Strictly adheres to PRD §6.3 (SCH-011, SCH-012, SCH-013) and §5.4..5.6 (FR-EXT-003, FR-EXT-004, FR-CNF-001..003).
 """
 
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class ExecutionMode(str, Enum):
+    """Execution mode provenance tracking (SCH-007)."""
+    GENUINE_LLM = "genuine_llm"
+    HEURISTIC = "heuristic"
+    HEURISTIC_FALLBACK = "heuristic_fallback"
+    MOCK = "mock"
+
+
+class ExecutionProvenance(BaseModel):
+    """
+    PRD SCH-007 execution provenance for benchmark and audit verification.
+    Created strictly by trusted application runtime code, never by the LLM response.
+    Application runtime trust boundary (not cryptographic attestation).
+    """
+    mode: ExecutionMode = Field(..., description="Actual execution mode used to produce fields")
+    model_name: Optional[str] = Field(default=None, description="Actual provider or model identifier")
+    provider: Optional[str] = Field(default=None, description="Inference engine/provider (e.g. litellm, mock)")
+    prompt_version: str = Field(default="1.0.0", description="Extraction prompt version")
+    fallback_occurred: bool = Field(default=False, description="Whether heuristic fallback was triggered")
+    fallback_reason: Optional[str] = Field(default=None, description="Exception or error triggering fallback")
+    request_id: Optional[str] = Field(default=None, description="Provider completion or request ID when available")
+    details: Dict[str, Any] = Field(default_factory=dict, description="Additional execution diagnostics")
+
+    def is_genuine_llm(self) -> bool:
+        """True if and only if genuine LLM execution completed without heuristic fallback."""
+        return self.mode == ExecutionMode.GENUINE_LLM and not self.fallback_occurred
+
+    def is_trusted_for_benchmark(self, allow_mock: bool = False) -> bool:
+        """
+        Benchmark verification: rejects heuristic and heuristic fallback.
+        Permits mock only if explicitly enabled for deterministic offline testing.
+        """
+        if self.fallback_occurred:
+            return False
+        if self.mode == ExecutionMode.GENUINE_LLM:
+            return bool(self.model_name and self.model_name.strip())
+        if allow_mock and self.mode == ExecutionMode.MOCK:
+            return True
+        return False
+
+
+class ExtractionResult(BaseModel):
+    """
+    Execution wrapper encapsulating extracted payload model and verified execution provenance.
+    Separates model output from trusted runtime execution provenance.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    payload: BaseModel
+    provenance: ExecutionProvenance
+
 
 
 class EvidenceSnippet(BaseModel):
@@ -90,6 +144,10 @@ class RunMetadata(BaseModel):
     run_id: str
     model_versions: Dict[str, str] = Field(default_factory=dict)
     prompt_version: str = "1.0.0"
+    provenance: Optional[ExecutionProvenance] = Field(
+        default=None,
+        description="Execution provenance tracking model vs heuristic mode (SCH-007)",
+    )
 
 
 class CanonicalExtractionEnvelope(BaseModel):

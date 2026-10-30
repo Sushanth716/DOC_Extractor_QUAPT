@@ -23,6 +23,7 @@ from doc_extractor.exceptions import (
     SecurityCheckFailedError,
     StorageError,
     UnsupportedFileError,
+    LLMExecutionError,
 )
 from doc_extractor.idempotency import IdempotencyStore, LocalIdempotencyStore
 from doc_extractor.ingestion import IngestionResult, IngestionService, ProcessingStatus
@@ -72,12 +73,21 @@ from doc_extractor.contracts_c import (
     CanonicalOutputEnvelope,
     DocumentMetadata,
     EvidenceSnippet,
+    ExecutionMode,
+    ExecutionProvenance,
+    ExtractionResult,
     ExtractedField,
     FlagItem,
     RunMetadata,
 )
 from doc_extractor.extractor import SchemaGuidedExtractor
 from doc_extractor.pipeline_c import ModuleCPipeline
+from doc_extractor.field_assembly import (
+    assemble_canonical_envelope,
+    assemble_field_entry,
+)
+from doc_extractor.rule_evaluator import evaluate_dynamic_rules
+from doc_extractor.dynamic_adapter import DynamicExtractionAdapter
 
 __all__ = [
     "__version__",
@@ -139,7 +149,15 @@ __all__ = [
     "ExtractedField",
     "FlagItem",
     "RunMetadata",
+    "ExecutionMode",
+    "ExecutionProvenance",
+    "ExtractionResult",
+    "LLMExecutionError",
     "SchemaGuidedExtractor",
     "ModuleCPipeline",
+    "DynamicExtractionAdapter",
+    "assemble_field_entry",
+    "assemble_canonical_envelope",
+    "evaluate_dynamic_rules",
 ]
 

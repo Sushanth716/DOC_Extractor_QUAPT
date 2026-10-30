@@ -4,11 +4,19 @@ Strictly adheres to PRD §5.4 (FR-EXT-001, FR-EXT-002, FR-EXT-003, FR-EXT-004, F
 and PRD §6.3 Output Contract.
 """
 
-from typing import Any, Dict, List, Optional, Tuple, Type
+from decimal import Decimal
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from pydantic import BaseModel
 import re
+import threading
 
 from doc_extractor.contracts_b import ModuleBOutputPayload, PageLayoutOutput, BoundingBox
+from doc_extractor.contracts_c import (
+    ExecutionMode,
+    ExecutionProvenance,
+    ExtractionResult,
+)
+from doc_extractor.exceptions import LLMExecutionError
 from doc_extractor.schemas import (
     CASASchema,
     InsuranceApplicationSchema,
@@ -46,6 +54,7 @@ def format_indian_currency(n: int) -> str:
 def find_evidence_for_value(
     value: Any,
     pages: List[PageLayoutOutput],
+    field_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     FR-EXT-004 & GR-002: Evidence Bounding Boxes.
@@ -56,10 +65,61 @@ def find_evidence_for_value(
     if value is None:
         return None
 
+    # Checkboxes: booleans must match visual checkbox marks (FR-EXT-007)
+    if isinstance(value, bool):
+        field_tokens = []
+        if field_name:
+            leaf = field_name.split(".")[-1].lower()
+            field_tokens = [t for t in re.split(r"[^a-z0-9]+", leaf) if len(t) >= 2]
+
+        matched_any_checkbox_for_field = False
+        for page in pages:
+            for cb in page.checkboxes:
+                cb_id_low = cb.mark_id.lower()
+                cb_tokens = [t for t in re.split(r"[^a-z0-9]+", cb_id_low) if len(t) >= 2 and t not in ("cb", "chk", "box", "checkbox", "mark")]
+                is_field_cb = (
+                    bool(field_tokens)
+                    and (
+                        any(t in field_tokens for t in cb_tokens)
+                        or any(t in cb_id_low for t in field_tokens if len(t) >= 3)
+                    )
+                )
+                if is_field_cb:
+                    matched_any_checkbox_for_field = True
+                    is_checked = (cb.state == "[x]")
+                    if is_checked == value:
+                        bbox = cb.bbox_original or cb.bbox_preprocessed
+                        return {
+                            "page": page.page_number,
+                            "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                            "text": cb.state,
+                            "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
+                        }
+
+        # If field_name matched specific checkbox marks but none matched the value state,
+        # never fall back to an unrelated checkbox mark.
+        if matched_any_checkbox_for_field:
+            return None
+
+        # Fallback for un-named calls or documents where checkboxes are unlabelled
+        if not field_name:
+            for page in pages:
+                for cb in page.checkboxes:
+                    is_checked = (cb.state == "[x]")
+                    if is_checked == value:
+                        bbox = cb.bbox_original or cb.bbox_preprocessed
+                        return {
+                            "page": page.page_number,
+                            "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                            "text": cb.state,
+                            "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
+                        }
+        return None
+
     candidates = [str(value).strip().lower()]
     clean_numeric_targets: List[str] = []
 
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float, Decimal)):
         num = float(value)
         if num.is_integer():
             int_val = int(num)
@@ -74,7 +134,7 @@ def find_evidence_for_value(
             ])
             clean_numeric_targets.append(str(int_val))
         else:
-            candidates.extend([f"{num:,.2f}", f"{num:.2f}"])
+            candidates.extend([f"{num:,.2f}", f"{num:.2f}", str(num)])
             clean_numeric_targets.append(f"{num:.2f}")
 
     def matches_text(text: str) -> bool:
@@ -124,19 +184,6 @@ def find_evidence_for_value(
                     "ocr_confidence": table.ocr_confidence,
                 }
 
-        # 4. Checkboxes (booleans only - FR-EXT-007)
-        if isinstance(value, bool):
-            for cb in page.checkboxes:
-                is_checked = (cb.state == "[x]")
-                if is_checked == value:
-                    bbox = cb.bbox_original or cb.bbox_preprocessed
-                    return {
-                        "page": page.page_number,
-                        "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
-                        "text": cb.state,
-                        "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
-                    }
-
     # GR-002 strict: never fabricate a bounding box. Return None if no grounded evidence found.
     return None
 
@@ -147,61 +194,225 @@ class SchemaGuidedExtractor:
     FR-EXT-001, FR-EXT-002: Extracts schema fields using LLM grammar-guided decoding
     (instructor + litellm) when use_llm=True. Falls back to deterministic heuristics
     for offline testing or when no LLM is configured.
+    Supports strict no-fallback mode and execution provenance tracking (SCH-007).
     """
 
-    def __init__(self, model_name: str = "Qwen2.5-7B-Instruct", use_llm: bool = False):
+    def __init__(
+        self,
+        model_name: str = "Qwen2.5-7B-Instruct",
+        use_llm: bool = False,
+        allow_fallback: bool = True,
+        prompt_version: str = "1.0.0",
+        provider_name: Optional[str] = None,
+        is_mock: bool = False,
+        llm_caller: Optional[Callable[[ModuleBOutputPayload, Type[BaseModel]], Tuple[BaseModel, Optional[str]]]] = None,
+    ):
         self.model_name = model_name
         self.use_llm = use_llm
+        self.allow_fallback = allow_fallback
+        self.prompt_version = prompt_version
+        self.provider_name = provider_name
+        self.is_mock = is_mock
+        self.llm_caller = llm_caller
+        self._local = threading.local()
+        self._local.last_provenance = None
+
+    @property
+    def last_provenance(self) -> Optional[ExecutionProvenance]:
+        """Thread-isolated last execution provenance for legacy callers."""
+        local = getattr(self, "_local", None)
+        if local is None:
+            return None
+        return getattr(local, "last_provenance", None)
+
+    @last_provenance.setter
+    def last_provenance(self, value: Optional[ExecutionProvenance]) -> None:
+        if not hasattr(self, "_local"):
+            self._local = threading.local()
+        self._local.last_provenance = value
 
     def extract(
         self,
         payload: ModuleBOutputPayload,
+        schema_cls: Optional[Type[BaseModel]] = None,
     ) -> BaseModel:
         """
+        Legacy/default extraction interface.
         Extracts structured data according to the bound schema.
-        When use_llm=True: uses instructor + litellm for grammar-constrained LLM extraction (FR-EXT-002).
-        Otherwise: uses deterministic regex heuristics as an offline fast-path / test double.
+        Preserves backward compatibility by returning BaseModel directly.
         """
-        doc_type = payload.classification.document_type.value
-        schema_cls = SCHEMA_MAP.get(doc_type)
+        result = self.extract_with_provenance(payload, schema_cls=schema_cls)
+        return result.payload
 
-        if not schema_cls:
+    def extract_with_provenance(
+        self,
+        payload: ModuleBOutputPayload,
+        schema_cls: Optional[Type[BaseModel]] = None,
+    ) -> ExtractionResult:
+        """
+        Extracts structured data and generates trusted execution provenance (SCH-007).
+        Enforces strict no-fallback behavior when allow_fallback=False.
+        """
+        # Reset provenance at start of execution to prevent stale provenance reuse
+        self.last_provenance = None
+
+        doc_type = payload.classification.document_type.value
+        target_schema = schema_cls or SCHEMA_MAP.get(doc_type)
+
+        if not target_schema:
             raise ValueError(f"No extraction schema registered for document type: {doc_type}")
 
-        if self.use_llm:
-            return self._extract_llm(payload, schema_cls)
+        # 1. Mock execution
+        if self.is_mock:
+            mock_model = self._extract_heuristic(payload, doc_type, target_schema)
+            prov = ExecutionProvenance(
+                mode=ExecutionMode.MOCK,
+                model_name=self.model_name,
+                provider="mock",
+                prompt_version=self.prompt_version,
+                fallback_occurred=False,
+            )
+            self.last_provenance = prov
+            return ExtractionResult(payload=mock_model, provenance=prov)
 
-        return self._extract_heuristic(payload, doc_type, schema_cls)
+        # 2. Genuine LLM requested
+        if self.use_llm:
+            try:
+                model_result, request_id = self._extract_llm_internal(payload, target_schema)
+                prov = ExecutionProvenance(
+                    mode=ExecutionMode.GENUINE_LLM,
+                    model_name=self.model_name,
+                    provider=self.provider_name or "litellm",
+                    prompt_version=self.prompt_version,
+                    fallback_occurred=False,
+                    request_id=request_id,
+                )
+                self.last_provenance = prov
+                return ExtractionResult(payload=model_result, provenance=prov)
+            except Exception as exc:
+                if not self.allow_fallback:
+                    prov = ExecutionProvenance(
+                        mode=ExecutionMode.GENUINE_LLM,
+                        model_name=self.model_name,
+                        provider=self.provider_name or "litellm",
+                        prompt_version=self.prompt_version,
+                        fallback_occurred=True,
+                        fallback_reason=str(exc),
+                    )
+                    self.last_provenance = prov
+                    raise LLMExecutionError(
+                        message=f"LLM extraction failed under strict no-fallback policy: {exc}",
+                        model_name=self.model_name,
+                        details={"cause": str(exc), "cause_type": type(exc).__name__},
+                    ) from exc
+
+                # Fallback enabled -> heuristic execution
+                heuristic_model = self._extract_heuristic(payload, doc_type, target_schema)
+                prov = ExecutionProvenance(
+                    mode=ExecutionMode.HEURISTIC_FALLBACK,
+                    model_name=self.model_name,
+                    provider=self.provider_name or "litellm",
+                    prompt_version=self.prompt_version,
+                    fallback_occurred=True,
+                    fallback_reason=str(exc),
+                )
+                self.last_provenance = prov
+                return ExtractionResult(payload=heuristic_model, provenance=prov)
+
+        # 3. Direct heuristic execution (use_llm=False)
+        heuristic_model = self._extract_heuristic(payload, doc_type, target_schema)
+        prov = ExecutionProvenance(
+            mode=ExecutionMode.HEURISTIC,
+            model_name="heuristic_regex_v1",
+            provider="regex_rules",
+            prompt_version=self.prompt_version,
+            fallback_occurred=False,
+        )
+        self.last_provenance = prov
+        return ExtractionResult(payload=heuristic_model, provenance=prov)
+
+    def _extract_llm_internal(
+        self,
+        payload: ModuleBOutputPayload,
+        schema_cls: Type[BaseModel],
+    ) -> Tuple[BaseModel, Optional[str]]:
+        """
+        Executes genuine LLM grammar-constrained extraction.
+        Returns (model_instance, request_id).
+        """
+        if self.llm_caller is not None:
+            res = self.llm_caller(payload, schema_cls)
+            if isinstance(res, tuple) and len(res) == 2:
+                model_inst, req_id = res
+            else:
+                model_inst, req_id = res, None
+
+            if model_inst is None:
+                raise ValueError("LLM caller returned None")
+
+            # Verify that response is valid schema instance
+            if not isinstance(model_inst, schema_cls):
+                if isinstance(model_inst, dict):
+                    model_inst = schema_cls.model_validate(model_inst)
+                else:
+                    raise ValueError(f"LLM caller returned {type(model_inst).__name__}, expected {schema_cls.__name__}")
+
+            request_id = str(req_id).strip() if (req_id is not None and str(req_id).strip()) else None
+            return model_inst, request_id
+
+        import instructor  # noqa: PLC0415
+        import litellm     # noqa: PLC0415
+
+        client = instructor.from_litellm(litellm.completion)
+        completion_res = client.chat.completions.create_with_completion(
+            model=self.model_name,
+            response_model=schema_cls,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a schema-constrained document extraction engine. "
+                        "Extract only the fields defined in the schema from the provided document text. "
+                        "If a field is absent or not legibly visible, set it to null. "
+                        "Never infer, guess, or hallucinate values. "
+                        "Return strictly valid JSON matching the schema."
+                    ),
+                },
+                {"role": "user", "content": payload.combined_markdown},
+            ],
+            temperature=0.0,
+        )
+
+        if isinstance(completion_res, tuple) and len(completion_res) == 2:
+            model_inst, raw_completion = completion_res
+        else:
+            model_inst, raw_completion = completion_res, None
+
+        if model_inst is None:
+            raise ValueError("LLM provider returned empty completion")
+
+        if not isinstance(model_inst, schema_cls):
+            if isinstance(model_inst, dict):
+                model_inst = schema_cls.model_validate(model_inst)
+            else:
+                raise ValueError(
+                    f"LLM provider returned invalid object of type {type(model_inst).__name__}, expected {schema_cls.__name__}"
+                )
+
+        request_id = None
+        if raw_completion is not None:
+            raw_id = getattr(raw_completion, "id", None)
+            if raw_id is not None and str(raw_id).strip():
+                request_id = str(raw_id).strip()
+
+        return model_inst, request_id
 
     def _extract_llm(self, payload: ModuleBOutputPayload, schema_cls: Type[BaseModel]) -> BaseModel:
-        """
-        FR-EXT-001 & FR-EXT-002: Grammar-constrained LLM extraction via instructor + litellm.
-        Temperature=0 ensures deterministic decoding.
-        """
+        """Backward-compatible internal delegate."""
         try:
-            import instructor  # noqa: PLC0415
-            import litellm     # noqa: PLC0415
-            client = instructor.from_litellm(litellm.completion)
-            return client.chat.completions.create(
-                model=self.model_name,
-                response_model=schema_cls,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a schema-constrained document extraction engine. "
-                            "Extract only the fields defined in the schema from the provided document text. "
-                            "If a field is absent or not legibly visible, set it to null. "
-                            "Never infer, guess, or hallucinate values. "
-                            "Return strictly valid JSON matching the schema."
-                        ),
-                    },
-                    {"role": "user", "content": payload.combined_markdown},
-                ],
-                temperature=0.0,
-            )
+            model_inst, _ = self._extract_llm_internal(payload, schema_cls)
+            return model_inst
         except Exception:
-            # Fallback to heuristic parser if litellm / instructor provider unavailable
             return self._extract_heuristic(payload, payload.classification.document_type.value, schema_cls)
 
     def _extract_heuristic(
@@ -353,5 +564,17 @@ class SchemaGuidedExtractor:
                     "duration": m[3].strip(),
                 })
             extracted_dict["medications"] = medications
+
+        if hasattr(schema_cls, "__field_metadata__"):
+            from schema_lifecycle.compiler import DynamicSchemaCompiler
+            meta_dict = getattr(schema_cls, "__field_metadata__", {})
+            for fpath, meta in meta_dict.items():
+                if "." not in fpath and "[]" not in fpath and fpath not in extracted_dict:
+                    extracted_dict[fpath] = None
+            nested = DynamicSchemaCompiler.unflatten(extracted_dict)
+            try:
+                return schema_cls.model_validate(nested)
+            except Exception:
+                return schema_cls.model_construct(**nested)
 
         return schema_cls.model_validate(extracted_dict)
