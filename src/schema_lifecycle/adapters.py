@@ -25,7 +25,7 @@ class SchemaVersionAdapter:
     def to_canonical(cls, version: Union[int, str]) -> int:
         """
         Converts an integer or string version representation to the canonical positive integer.
-        
+
         Examples:
             1 -> 1
             "3" -> 3
@@ -124,3 +124,98 @@ class SchemaVersionAdapter:
         canonical_version = cls.to_canonical(ref.schema_version)
         return ref.schema_id, canonical_version
 
+
+class LifecycleSchemaRegistryAdapter:
+    """
+    Adapter integrating SchemaLifecycleManager into the existing SchemaRegistry contract.
+    Strictly conforms to SchemaRegistry interface without modifying its public contract.
+    Enforces SCH-004 requirement that only approved schemas are resolved for production.
+    """
+
+    DEFAULT_MVP_MAPPINGS: Dict[Any, str] = {}
+
+    def __init__(
+        self,
+        manager: Any,
+        default_tenant: str = "default",
+        document_type_mappings: Optional[Dict[Any, str]] = None,
+    ) -> None:
+        from doc_extractor.classification.base import SchemaRegistry
+        from doc_extractor.contracts_b import MVPDocumentType
+
+        if not isinstance(self, SchemaRegistry):
+            # Dynamic mixin to satisfy isinstance(self, SchemaRegistry)
+            self.__class__ = type(
+                "LifecycleSchemaRegistryAdapter",
+                (LifecycleSchemaRegistryAdapter, SchemaRegistry),
+                {},
+            )
+
+        self.manager = manager
+        self.default_tenant = default_tenant
+
+        default_map = {
+            MVPDocumentType.DOC_01_CASA: "DOC-01",
+            MVPDocumentType.DOC_02_INSURANCE_APP: "DOC-02",
+            MVPDocumentType.DOC_03_DISCHARGE_SUMMARY: "DOC-03",
+        }
+        self.mappings = dict(document_type_mappings if document_type_mappings is not None else default_map)
+
+    def resolve_approved_schema(
+        self,
+        document_type: Any,
+        tenant_id: Optional[str] = None,
+    ) -> Any:
+        from doc_extractor.classification.base import SchemaResolutionError
+        from doc_extractor.contracts_b import MVPDocumentType
+        from schema_lifecycle.exceptions import SchemaNotApprovedError, SchemaNotFoundError
+
+        if document_type == MVPDocumentType.UNKNOWN:
+            raise SchemaResolutionError(
+                message="Cannot resolve schema for UNKNOWN document type (FR-CLS-002).",
+                document_type=document_type.value,
+                code="UNKNOWN_DOC_TYPE_NO_SCHEMA",
+            )
+
+        schema_id = self.mappings.get(document_type)
+        if not schema_id:
+            raise SchemaResolutionError(
+                message=f"No schema mapping configured for document type '{document_type.value}'.",
+                document_type=document_type.value,
+                code="NO_APPROVED_SCHEMA",
+            )
+
+        tid = tenant_id or self.default_tenant
+        try:
+            snapshot = self.manager.resolve_active_schema(tenant_id=tid, schema_id=schema_id)
+        except (SchemaNotApprovedError, SchemaNotFoundError) as exc:
+            raise SchemaResolutionError(
+                message=f"No approved schema active for document type '{document_type.value}': {exc.message}",
+                document_type=document_type.value,
+                code="NO_APPROVED_SCHEMA",
+            ) from exc
+
+        return SchemaVersionAdapter.to_approved_schema_ref(
+            schema=snapshot.definition,
+            document_type=document_type,
+            is_active=True,
+        )
+
+    def is_schema_approved(
+        self,
+        schema_id: str,
+        schema_version: str,
+        tenant_id: Optional[str] = None,
+    ) -> bool:
+        from schema_lifecycle.enums import SchemaStatus
+
+        tid = tenant_id or self.default_tenant
+        try:
+            canonical_ver = SchemaVersionAdapter.to_canonical(schema_version)
+        except Exception:
+            return False
+
+        snapshot = self.manager.repository.get_snapshot(schema_id, canonical_ver, tid)
+        if snapshot is None:
+            return False
+        return snapshot.status == SchemaStatus.APPROVED

@@ -234,6 +234,7 @@ class SchemaDefinition(BaseModel):
     schema_id: str = Field(..., description="Unique schema identifier (e.g. 'casa_account_opening')")
     version: int = Field(..., description="Canonical integer schema version (e.g. 1, 2, 3)")
     status: SchemaStatus = Field(default=SchemaStatus.DRAFT, description="Schema lifecycle status (SCH-004)")
+    tenant_id: Optional[str] = Field(default=None, description="Tenant identifier for multi-tenant isolation")
     domain: Optional[str] = Field(default=None, description="Industry domain (e.g. 'BFSI', 'Healthcare')")
     document_type: Optional[str] = Field(default=None, description="Document type name or enum mapping")
     description: Optional[str] = Field(default=None, description="Human-readable schema description")
