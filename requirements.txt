@@ -14,3 +14,6 @@ numpy>=1.24.0
 # Module C: Schema-Guided Extraction & Normalization
 instructor>=1.0.0
 litellm>=1.40.0
+
+# Schema Lifecycle: Schema Metamodel & YAML/JSON Serialization (SCH-003)
+PyYAML>=6.0.0
