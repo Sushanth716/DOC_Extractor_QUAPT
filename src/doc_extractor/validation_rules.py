@@ -1,6 +1,6 @@
 """
 Deterministic Normalization and Business Logic Validation Rules.
-Strictly adheres to PRD §5.5 (FR-VAL-001 through FR-VAL-004) and PRD §6.3.
+Strictly adheres to PRD §5.5 (FR-VAL-001 through FR-VAL-004), §5.6 (FR-CNF-001..003) and PRD §6.3.
 """
 
 from datetime import datetime
@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Regex patterns
 PAN_REGEX = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
+IFSC_REGEX = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 PHONE_DIGITS_REGEX = re.compile(r"\D")
 
 
@@ -38,9 +39,32 @@ VERHOEFF_P = [
     [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
 ]
 
+VERHOEFF_INV = [0, 4, 3, 2, 1, 5, 6, 7, 8, 9]
 
-def validate_aadhaar_checksum(aadhaar_str: str) -> bool:
-    """Validate 12-digit Aadhaar number using Verhoeff algorithm."""
+
+def compute_verhoeff_checksum(num_str: str) -> int:
+    """Computes the Verhoeff check digit for a string of digits."""
+    clean = re.sub(r"\D", "", str(num_str))
+    c = 0
+    reversed_digits = [int(d) for d in reversed(clean)]
+    for i, item in enumerate(reversed_digits):
+        c = VERHOEFF_D[c][VERHOEFF_P[(i + 1) % 8][item]]
+    return VERHOEFF_INV[c]
+
+
+def generate_valid_aadhaar(prefix_11_digits: str = "23456789012") -> str:
+    """Helper to generate a valid 12-digit Aadhaar number with valid Verhoeff checksum."""
+    clean = re.sub(r"\D", "", prefix_11_digits)[:11].ljust(11, "0")
+    check_digit = compute_verhoeff_checksum(clean)
+    return f"{clean}{check_digit}"
+
+
+def validate_aadhaar_checksum(aadhaar_str: Optional[str]) -> bool:
+    """
+    FR-VAL-002: Validate 12-digit Aadhaar number using Verhoeff algorithm.
+    """
+    if not aadhaar_str:
+        return False
     clean_digits = re.sub(r"\s+", "", str(aadhaar_str))
     if not re.match(r"^\d{12}$", clean_digits):
         return False
@@ -51,9 +75,48 @@ def validate_aadhaar_checksum(aadhaar_str: str) -> bool:
     return c == 0
 
 
+def validate_aadhaar(aadhaar_val: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Validates and normalizes 12-digit Aadhaar number.
+    Returns (cleaned_aadhaar, error_message).
+    """
+    if not aadhaar_val:
+        return None, None
+    clean = re.sub(r"[\s\-]+", "", str(aadhaar_val)).strip()
+    if not re.match(r"^\d{12}$", clean):
+        return clean, "INVALID_AADHAAR_LENGTH"
+    if not validate_aadhaar_checksum(clean):
+        return clean, "INVALID_AADHAAR_CHECKSUM"
+    return clean, None
+
+
+def validate_pan(pan_value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    FR-VAL-002: Indian PAN format validation: ^[A-Z]{5}[0-9]{4}[A-Z]$.
+    """
+    if not pan_value or not isinstance(pan_value, str):
+        return None, None
+    val = pan_value.strip().upper()
+    if PAN_REGEX.match(val):
+        return val, None
+    return val, "INVALID_PAN_FORMAT"
+
+
+def validate_ifsc(ifsc_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    FR-VAL-002: Indian IFSC code validation: ^[A-Z]{4}0[A-Z0-9]{6}$.
+    """
+    if not ifsc_str or not isinstance(ifsc_str, str):
+        return None, None
+    val = ifsc_str.strip().upper()
+    if IFSC_REGEX.match(val):
+        return val, None
+    return val, "INVALID_IFSC_FORMAT"
+
+
 def normalize_date_to_iso(date_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Normalizes a variety of date formats (DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY, DD Month YYYY)
+    FR-VAL-001: Normalizes a variety of date formats (DD/MM/YYYY, YYYY-MM-DD, DD-MM-YYYY, DD-Mon-YYYY)
     to ISO 8601 (YYYY-MM-DD).
     Returns (normalized_date, error_message).
     """
@@ -68,9 +131,14 @@ def normalize_date_to_iso(date_str: Optional[str]) -> Tuple[Optional[str], Optio
         "%d/%m/%Y",
         "%d-%m-%Y",
         "%d.%m.%Y",
+        "%d-%b-%Y",
         "%d %b %Y",
+        "%d-%B-%Y",
         "%d %B %Y",
         "%Y/%m/%d",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%m/%d/%Y",
     ]
     for fmt in date_formats:
         try:
@@ -82,9 +150,12 @@ def normalize_date_to_iso(date_str: Optional[str]) -> Tuple[Optional[str], Optio
     return raw, "INVALID_DATE_FORMAT"
 
 
-def normalize_phone_number(phone_str: Optional[str], default_country_code: str = "+91") -> Tuple[Optional[str], Optional[str]]:
+def normalize_phone_number(
+    phone_str: Optional[str],
+    default_country_code: str = "+91"
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Normalizes phone number to E.164 standard (+91... for 10-digit Indian numbers).
+    FR-VAL-001: Normalizes phone number to E.164 standard (+91... for 10-digit Indian numbers).
     """
     if not phone_str or not isinstance(phone_str, str):
         return None, None
@@ -102,16 +173,48 @@ def normalize_phone_number(phone_str: Optional[str], default_country_code: str =
     return raw, "INVALID_PHONE_FORMAT"
 
 
-def validate_pan(pan_value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def normalize_currency_amount(
+    amount_input: Any,
+    default_currency: str = "INR"
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     """
-    FR-VAL-002: PAN format validation: ^[A-Z]{5}[0-9]{4}[A-Z]$.
+    FR-VAL-001: Normalizes currency / amounts to float decimal and currency code.
+    e.g. '10,000 INR' -> (10000.0, 'INR', None)
+         'Rs. 45,250.75' -> (45250.75, 'INR', None)
+         '$1,200.00' -> (1200.0, 'USD', None)
     """
-    if not pan_value or not isinstance(pan_value, str):
-        return None, None
-    val = pan_value.strip().upper()
-    if PAN_REGEX.match(val):
-        return val, None
-    return val, "INVALID_PAN_FORMAT"
+    if amount_input is None:
+        return None, default_currency, None
+
+    if isinstance(amount_input, (int, float)):
+        return float(amount_input), default_currency, None
+
+    raw = str(amount_input).strip()
+    if not raw:
+        return None, default_currency, None
+
+    currency = default_currency
+    if "INR" in raw.upper() or "RS" in raw.upper() or "₹" in raw:
+        currency = "INR"
+    elif "USD" in raw.upper() or "$" in raw:
+        currency = "USD"
+    elif "EUR" in raw.upper() or "€" in raw:
+        currency = "EUR"
+    elif "GBP" in raw.upper() or "£" in raw:
+        currency = "GBP"
+
+    # Extract numeric part (handles negative amounts, currency prefixes with dots like Rs.)
+    has_leading_minus = raw.strip().startswith("-")
+    match = re.search(r"(-?\d+(?:\.\d+)?)", raw.replace(",", ""))
+    if match:
+        try:
+            val = float(match.group(1))
+            if has_leading_minus and val > 0:
+                val = -val
+            return val, currency, None
+        except ValueError:
+            pass
+    return None, currency, "INVALID_AMOUNT_FORMAT"
 
 
 def validate_chronology(
@@ -159,3 +262,29 @@ def validate_arithmetic(
             "fields": ["line_items", "total_amount"],
         }
     return None
+
+
+def calculate_calibrated_confidence(
+    ocr_confidence: float,
+    model_confidence: float = 1.0,
+    validation_passed: bool = True,
+    is_handwritten: bool = False,
+    has_evidence: bool = True,
+) -> float:
+    """
+    FR-CNF-001: Combines OCR optical confidence, model score, and validation status
+    into a calibrated score in [0.0, 1.0].
+    """
+    if not has_evidence:
+        return 0.0
+
+    score = ocr_confidence * model_confidence
+
+    if is_handwritten:
+        # Handwriting penalty per FR-CNF-002
+        score *= 0.85
+
+    if not validation_passed:
+        score *= 0.50
+
+    return max(0.0, min(1.0, round(score, 2)))

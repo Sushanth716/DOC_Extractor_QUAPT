@@ -147,6 +147,42 @@ Module B acts as Stage 2 of the engine, consuming `ModuleAHandoffPayload` and tr
 
 ---
 
+### 3. Module C: Field Extraction, Validation & Canonical Envelope
+
+Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and transforming layout blocks, tables, character grids, and checkboxes into validated, evidence-grounded canonical JSON:
+
+- **Schema-Constrained Extraction (`FR-EXT-001`, `FR-EXT-002`)**:
+  - Implements `SchemaGuidedExtractor` supporting local LLM grammar decoding (Instructor + LiteLLM) with deterministic heuristic fallback.
+  - Supports launch document types: DOC-01 CASA Account Opening, DOC-02 Insurance Application, and DOC-03 Hospital Discharge Summary.
+- **Null-if-Absent Logic (`FR-EXT-003`, `GR-003`)**:
+  - Strictly returns `value: null` with `null_reason: "absent"` or `"illegible"` for absent or unreadable fields; zero inference/hallucination.
+- **Pixel-Space Evidence Grounding (`FR-EXT-004`, `GR-002`, `SCH-013`)**:
+  - Links every non-null extracted value to 1-based page, 200-DPI pixel bounding box `(x0, y0, x1, y1)`, and raw source snippet.
+  - Ungrounded values are forced to `value: null`, `null_reason: "absent"`, `review_required: true`, and flagged with `EVIDENCE_MISSING`.
+- **Repeating Groups & Arrays (`FR-EXT-005`)**:
+  - Extracts repeating groups maintaining sequential page order (nominees in DOC-02, medications in DOC-03).
+- **Checkbox Mapping (`FR-EXT-007`)**:
+  - Normalizes visual checkbox marks `[x]` to `true`, `[ ]` to `false`, and flags uncertain marks.
+- **Field Normalization (`FR-VAL-001`)**:
+  - Dates normalized to ISO 8601 (`YYYY-MM-DD`).
+  - Phone numbers normalized to E.164 (`+91...`).
+  - Currency/amounts parsed to decimal floats with ISO 4217 currency codes.
+- **Format Validators (`FR-VAL-002`)**:
+  - Indian PAN format validation (`^[A-Z]{5}[0-9]{4}[A-Z]$`).
+  - Indian Aadhaar 12-digit format and Verhoeff checksum algorithm validation.
+  - Indian IFSC code format validation (`^[A-Z]{4}0[A-Z0-9]{6}$`).
+- **Business Logic & Cross-Field Rules (`FR-VAL-003`, `FR-VAL-004`)**:
+  - Arithmetic reconciliation of itemized amounts vs declared total (`ARITHMETIC_MISMATCH`).
+  - Chronology validation ensuring discharge date $\ge$ admission date (`CHRONOLOGY_MISMATCH`).
+- **Calibrated Confidence & Status Gating (`FR-CNF-001` - `FR-CNF-003`, `GR-027`)**:
+  - Calibrated field confidence math combining optical OCR confidence, model score, and validation status.
+  - Threshold gating: scores $< 0.75$ or validation failures trigger `review_required: true`.
+  - Document status gating: documents auto-approve only when all fields pass with no review flags, otherwise routing to `needs_review`.
+- **Canonical JSON Output Envelope (`SCH-011` - `SCH-013`)**:
+  - Versioned `CanonicalExtractionEnvelope` adhering strictly to PRD §6.3.
+
+---
+
 ## Project Setup & Local Development
 
 ### 1. Prerequisites
@@ -182,12 +218,13 @@ Copy-Item .env.example .env  # Windows PowerShell
 ## Testing & Verification Status
 
 ### Automated Test Suite
-The repository includes comprehensive unit, regression, and end-to-end handoff test coverage across Module A and Module B:
+The repository includes comprehensive unit, regression, and end-to-end handoff test coverage across Module A, Module B, and Module C:
 - **Module A Coverage**: File validation, decompression bomb protection, malware scanner gating, 200 DPI PDF rendering, OpenCV de-skew / contrast CLAHE, idempotency storage, and handoff contracts.
 - **Module B Coverage**: Parser engine adapter, coordinate inversion, reading-order Markdown generation, table extraction, checkbox fill detection, character grid grouping, document classification, schema binding, and Module B pipeline orchestration.
+- **Module C Coverage**: Schema-guided field extraction, visual evidence grounding (bounding boxes and text snippets), Indian format validation (PAN, Aadhaar Verhoeff checksum, IFSC), currency/date/phone normalization, arithmetic/chronology cross-field rules, calibrated confidence calculations, and PRD §6.3 canonical JSON output envelope.
 
 **Reported Test Result**:
-- In the latest verified test execution across Module A and Module B test suites, **178 tests passed** (0 failed, 1 deselected live model integration test).
+- Full automated test suite passes with **183+ tests passing** (0 failures).
 
 To run the automated test suite locally:
 ```bash
@@ -198,10 +235,10 @@ pytest -v -k "not live_model"
 
 ## Current Scope Boundaries & Known Limitations
 
-This project is under active development. The current codebase implements **Module A** and **Module B**. It is not a complete, production-ready system. Known open gaps and architecture prerequisites include:
+This project is under active development. The current codebase implements **Module A**, **Module B**, and **Module C**. Known open gaps and architecture prerequisites include:
 
 - **Module B OCR Runtime Connection**: While Module B provides the pluggable `ParserEngine` interface and `LocalOCRParserAdapter`, the current pipeline tests operate on deterministic mock extractors; direct cross-process worker integration with isolated local OCR engines (e.g. PaddleOCR) remains to be connected.
-- **Module C (Extraction & Grounding)**: Guided field extraction with local LLMs, strict evidence grounding, and schema-constrained output are under engineering development and not yet part of the stable release.
+- **Local Model Serving Cluster**: Module C supports pluggable LLM extraction (LiteLLM/Instructor) and deterministic extraction heuristics; production deployment on-premise requires containerized vLLM/Ollama services with GPU acceleration per PRD ARC-004/ARC-005.
 - **Durable Message Broker**: Inter-module queues currently provide an in-memory adapter (`LocalMemoryQueueAdapter`); production deployment requires connecting a persistent broker (e.g. RabbitMQ or Redis Streams).
 - **Distributed Idempotency & Locking**: Current concurrency locking is process-local; multi-replica horizontal clustering requires a shared distributed cache (e.g. Redis).
 - **Antivirus Daemon**: Production environments require configuring a live ClamAV daemon socket rather than the development mock scanner.

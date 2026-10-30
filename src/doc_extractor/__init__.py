@@ -67,6 +67,17 @@ from doc_extractor.validation import (
     ValidationResult,
     detect_magic_format,
 )
+from doc_extractor.contracts_c import (
+    CanonicalExtractionEnvelope,
+    CanonicalOutputEnvelope,
+    DocumentMetadata,
+    EvidenceSnippet,
+    ExtractedField,
+    FlagItem,
+    RunMetadata,
+)
+from doc_extractor.extractor import SchemaGuidedExtractor
+from doc_extractor.pipeline_c import ModuleCPipeline
 
 __all__ = [
     "__version__",
@@ -121,5 +132,14 @@ __all__ = [
     "QueueAdapter",
     "LocalMemoryQueueAdapter",
     "ModuleAPipeline",
+    "CanonicalExtractionEnvelope",
+    "CanonicalOutputEnvelope",
+    "DocumentMetadata",
+    "EvidenceSnippet",
+    "ExtractedField",
+    "FlagItem",
+    "RunMetadata",
+    "SchemaGuidedExtractor",
+    "ModuleCPipeline",
 ]
 
