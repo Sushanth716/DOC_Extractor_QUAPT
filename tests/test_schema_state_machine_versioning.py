@@ -537,8 +537,9 @@ def test_schema_registry_adapter_compatibility():
     manager = SchemaLifecycleManager()
 
     # Seed approved CASA schema (DOC-01) for tenant_alpha
-    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.APPROVED)
+    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.TESTING)
     manager.create_schema("tenant_alpha", casa_def, author="admin")
+    manager.internal_promote_to_approved("tenant_alpha", "DOC-01", 1, approver="approver")
 
     adapter = LifecycleSchemaRegistryAdapter(
         manager=manager,
@@ -582,8 +583,9 @@ def test_schema_registry_adapter_pipeline_b_integration():
     manager = SchemaLifecycleManager()
 
     # Seed approved CASA schema (DOC-01)
-    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.APPROVED)
+    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.TESTING)
     manager.create_schema("tenant_alpha", casa_def, author="admin")
+    manager.internal_promote_to_approved("tenant_alpha", "DOC-01", 1, approver="approver")
 
     adapter = LifecycleSchemaRegistryAdapter(
         manager=manager,
@@ -727,8 +729,9 @@ def test_edge_cases_rollback_to_previously_approved_then_retired_version():
 def test_edge_cases_adapter_graceful_failures():
     """Validates LifecycleSchemaRegistryAdapter returns False/handles invalid version strings."""
     manager = SchemaLifecycleManager()
-    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.APPROVED)
+    casa_def = make_test_schema(schema_id="DOC-01", version=1, status=SchemaStatus.TESTING)
     manager.create_schema("tenant_alpha", casa_def, author="admin")
+    manager.internal_promote_to_approved("tenant_alpha", "DOC-01", 1, approver="approver")
 
     adapter = LifecycleSchemaRegistryAdapter(manager=manager, default_tenant="tenant_alpha")
 
@@ -882,8 +885,9 @@ def test_bind_test_schema_rejects_retired_status():
 def test_bind_test_schema_rejects_approved_status():
     """Verify that schemas in APPROVED status are rejected by test harness binding (strictly for TESTING)."""
     manager = SchemaLifecycleManager()
-    schema_def = make_test_schema(status=SchemaStatus.APPROVED)
+    schema_def = make_test_schema(status=SchemaStatus.TESTING)
     manager.create_schema("tenant_alpha", schema_def, author="author_alice")
+    manager.internal_promote_to_approved("tenant_alpha", "DOC-01", 1, approver="approver_bob")
 
     with pytest.raises(InvalidStateTransitionError) as exc_info:
         manager.bind_test_schema("tenant_alpha", "DOC-01", 1)
@@ -928,8 +932,9 @@ def test_bind_test_schema_does_not_modify_production_active_pointer_or_status():
     """
     manager = SchemaLifecycleManager()
     # v1 is approved and active in production
-    v1_def = make_test_schema(version=1, status=SchemaStatus.APPROVED)
+    v1_def = make_test_schema(version=1, status=SchemaStatus.TESTING)
     manager.create_schema("tenant_alpha", v1_def, author="alice")
+    manager.internal_promote_to_approved("tenant_alpha", "DOC-01", 1, approver="approver")
     assert manager.resolve_active_schema("tenant_alpha", "DOC-01").version == 1
 
     # v2 is created as draft and transitioned to testing

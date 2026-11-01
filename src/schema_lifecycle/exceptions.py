@@ -225,3 +225,98 @@ class TenantAccessError(SchemaLifecycleError):
             merged["tenant_id"] = tenant_id
         super().__init__(message=message, code=code, details=merged)
         self.tenant_id = tenant_id
+
+
+class UnauthenticatedError(SchemaLifecycleError):
+    """Raised when authentication is missing, invalid, or principal is inactive (SEC-001)."""
+
+    def __init__(
+        self,
+        message: str = "Authentication required or principal is inactive.",
+        code: str = "UNAUTHENTICATED",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, details=details)
+
+
+class ForbiddenActionError(SchemaLifecycleError):
+    """Raised when a principal lacks required permissions or roles (SEC-003)."""
+
+    def __init__(
+        self,
+        message: str = "Principal lacks required role or permission for this operation.",
+        code: str = "FORBIDDEN",
+        principal_id: Optional[str] = None,
+        permission: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        merged = dict(details or {})
+        if principal_id:
+            merged["principal_id"] = principal_id
+        if permission:
+            merged["permission"] = permission
+        super().__init__(message=message, code=code, details=merged)
+        self.principal_id = principal_id
+        self.permission = permission
+
+
+class SchemaSelfApprovalError(ForbiddenActionError):
+    """
+    Raised when a schema author attempts to approve their own schema version (SCH-005, SEC-003).
+    Standard PRD proposed code: SCHEMA_SELF_APPROVAL.
+    """
+
+    def __init__(
+        self,
+        message: str = "A second person must approve this schema. Authors cannot approve their own schema version.",
+        schema_id: Optional[str] = None,
+        version: Optional[int] = None,
+        author: Optional[str] = None,
+        code: str = "SCHEMA_SELF_APPROVAL",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        merged = dict(details or {})
+        if schema_id:
+            merged["schema_id"] = schema_id
+        if version is not None:
+            merged["version"] = version
+        if author:
+            merged["author"] = author
+        super().__init__(
+            message=message,
+            code=code,
+            principal_id=author,
+            permission="schema:approve",
+            details=merged,
+        )
+        self.schema_id = schema_id
+        self.version = version
+        self.author = author
+
+
+class BenchmarkVerificationError(SchemaLifecycleError):
+    """
+    Raised when test harness results fail verification or do not qualify for approval (SCH-005, SCH-007).
+    Standard PRD code: HARNESS_RESULT_INVALID.
+    """
+
+    def __init__(
+        self,
+        message: str = "Test harness result failed validation or does not qualify for schema approval.",
+        harness_run_id: Optional[str] = None,
+        schema_id: Optional[str] = None,
+        version: Optional[int] = None,
+        code: str = "HARNESS_RESULT_INVALID",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        merged = dict(details or {})
+        if harness_run_id:
+            merged["harness_run_id"] = harness_run_id
+        if schema_id:
+            merged["schema_id"] = schema_id
+        if version is not None:
+            merged["version"] = version
+        super().__init__(message=message, code=code, details=merged)
+        self.harness_run_id = harness_run_id
+        self.schema_id = schema_id
+        self.version = version

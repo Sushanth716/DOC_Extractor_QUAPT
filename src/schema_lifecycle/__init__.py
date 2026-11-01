@@ -12,16 +12,35 @@ from schema_lifecycle.enums import (
     SchemaStatus,
 )
 from schema_lifecycle.exceptions import (
+    BenchmarkVerificationError,
+    ForbiddenActionError,
     InvalidStateTransitionError,
     SchemaLifecycleError,
     SchemaNotApprovedError,
     SchemaNotFoundError,
     SchemaPromotionNotAllowedError,
     SchemaRollbackError,
+    SchemaSelfApprovalError,
     SchemaSerializationError,
     SchemaValidationError,
     SchemaVersionError,
     TenantAccessError,
+    UnauthenticatedError,
+)
+from schema_lifecycle.roles import (
+    AuthenticatedPrincipal,
+    DefaultSchemaAuthorizer,
+    Role,
+    ROLE_PERMISSIONS,
+    SchemaAuthorizer,
+    SchemaPermission,
+)
+from schema_lifecycle.approval import (
+    ApprovalPolicy,
+    BenchmarkReportStore,
+    BenchmarkResultVerifier,
+    InMemoryBenchmarkReportStore,
+    SchemaApprovalService,
 )
 from schema_lifecycle.metamodel import (
     FieldDefinition,
@@ -52,6 +71,7 @@ from schema_lifecycle.state_machine import (
 )
 from schema_lifecycle.repository import (
     InMemorySchemaRepository,
+    SchemaApprovalRecord,
     SchemaRepository,
     SchemaSnapshot,
 )
@@ -74,17 +94,31 @@ __all__ = [
     "PIIClass",
     "RuleOnFail",
     "LifecycleEventType",
+    "Role",
+    "SchemaPermission",
+    "ROLE_PERMISSIONS",
     # Metamodel
     "FieldDefinition",
     "RuleDefinition",
     "SchemaDefinition",
     # Snapshots & Repository
     "SchemaSnapshot",
+    "SchemaApprovalRecord",
     "SchemaRepository",
     "InMemorySchemaRepository",
     # State Machine & Manager
     "SchemaStateMachine",
     "SchemaLifecycleManager",
+    # Roles & Authorization
+    "AuthenticatedPrincipal",
+    "SchemaAuthorizer",
+    "DefaultSchemaAuthorizer",
+    # Approval & Benchmark Verification
+    "ApprovalPolicy",
+    "BenchmarkReportStore",
+    "InMemoryBenchmarkReportStore",
+    "BenchmarkResultVerifier",
+    "SchemaApprovalService",
     # Events & Diff
     "LifecycleEvent",
     "compute_schema_diff",
@@ -116,4 +150,8 @@ __all__ = [
     "SchemaPromotionNotAllowedError",
     "SchemaRollbackError",
     "TenantAccessError",
+    "UnauthenticatedError",
+    "ForbiddenActionError",
+    "SchemaSelfApprovalError",
+    "BenchmarkVerificationError",
 ]

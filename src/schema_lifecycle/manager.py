@@ -8,15 +8,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
+import uuid
 
 from schema_lifecycle.diff import compute_schema_diff
 from schema_lifecycle.enums import SchemaStatus
 from schema_lifecycle.events import LifecycleEvent, LifecycleEventType
 from schema_lifecycle.exceptions import (
+    ForbiddenActionError,
     InvalidStateTransitionError,
     SchemaNotApprovedError,
     SchemaNotFoundError,
+    SchemaPromotionNotAllowedError,
     SchemaRollbackError,
+    SchemaSelfApprovalError,
     SchemaVersionError,
     TenantAccessError,
 )
@@ -24,6 +28,7 @@ from schema_lifecycle.adapters import SchemaVersionAdapter
 from schema_lifecycle.metamodel import SchemaDefinition
 from schema_lifecycle.repository import (
     InMemorySchemaRepository,
+    SchemaApprovalRecord,
     SchemaRepository,
     SchemaSnapshot,
 )
@@ -36,8 +41,25 @@ class SchemaLifecycleManager:
     creation, non-destructive rollbacks, and production schema resolution.
     """
 
-    def __init__(self, repository: Optional[SchemaRepository] = None) -> None:
+    def __init__(
+        self,
+        repository: Optional[SchemaRepository] = None,
+        approval_service: Optional[Any] = None,
+        strict_approval_gate: bool = False,
+    ) -> None:
         self.repository = repository or InMemorySchemaRepository()
+        self._approval_service: Optional[Any] = approval_service
+        self._approval_token: Optional[str] = None
+        self._strict_approval_gate: bool = strict_approval_gate or (approval_service is not None)
+
+    def set_approval_service(self, service: Any, token: Optional[str] = None) -> None:
+        """
+        Binds the trusted SchemaApprovalService capability to lock down direct promotion bypass (SCH-005).
+        Once bound, direct promotions via internal_promote_to_approved() without the trusted token are blocked.
+        """
+        self._approval_service = service
+        self._approval_token = token or uuid.uuid4().hex
+        self._strict_approval_gate = True
 
     def create_schema(
         self,
@@ -53,6 +75,14 @@ class SchemaLifecycleManager:
         """
         if not author or not isinstance(author, str) or not author.strip():
             raise ValueError("Author identity must be a non-empty string.")
+
+        # Eliminate approval bypass (SCH-004, SCH-005): Creating schema directly as approved is rejected
+        if definition.status == SchemaStatus.APPROVED:
+            raise SchemaPromotionNotAllowedError(
+                message="Cannot create schema directly in 'approved' status. Schemas must start in 'draft' or 'testing' (SCH-004, SCH-005).",
+                schema_id=definition.schema_id,
+                version=definition.version,
+            )
 
         # Check if schema already exists for this tenant
         existing = self.repository.get_latest_version(definition.schema_id, tenant_id)
@@ -80,17 +110,12 @@ class SchemaLifecycleManager:
 
         self.repository.save_snapshot(snapshot)
 
-        event_type = (
-            LifecycleEventType.APPROVED
-            if definition.status == SchemaStatus.APPROVED
-            else LifecycleEventType.CREATED
-        )
         self.repository.record_event(
             LifecycleEvent(
                 tenant_id=tenant_id,
                 schema_id=definition.schema_id,
                 version=definition.version,
-                event_type=event_type,
+                event_type=LifecycleEventType.CREATED,
                 actor=author.strip(),
                 timestamp=now,
                 from_status=None,
@@ -98,10 +123,6 @@ class SchemaLifecycleManager:
                 details={"diff_summary": diff["summary"]},
             )
         )
-
-        # If created directly as approved (e.g. test seeding / MVP pre-approved), activate pointer
-        if definition.status == SchemaStatus.APPROVED:
-            self.repository.set_active_version(definition.schema_id, definition.version, tenant_id)
 
         return snapshot
 
@@ -252,12 +273,32 @@ class SchemaLifecycleManager:
         approver: str,
         harness_run_id: Optional[str] = None,
         reason: Optional[str] = None,
+        *,
+        trusted_token: Optional[str] = None,
+        event: Optional[LifecycleEvent] = None,
+        approval_record: Optional[SchemaApprovalRecord] = None,
     ) -> SchemaSnapshot:
         """
-        Controlled internal integration point reserved exclusively for TASK-4.2 approval service.
+        Controlled internal integration point.
         Promotes a schema version from 'testing' to 'approved' after four-eyes review
-        and test-harness verification. Ordinary lifecycle callers cannot invoke promotion.
+        and test-harness verification.
+        Enforces four-eyes author exclusion (SCH-005, SEC-003).
+        Atomically updates status, approved_by, harness_run_id, and active version pointer.
+        Blocks direct promotion bypass when an approval gate is configured (Check 1).
         """
+        # Block direct unauthorized bypass when approval gate is active
+        if self._strict_approval_gate or self._approval_service is not None:
+            if not trusted_token or trusted_token != self._approval_token:
+                raise ForbiddenActionError(
+                    message=(
+                        "Direct unauthorized promotion via internal_promote_to_approved() is blocked. "
+                        "Schema promotion must be authorized through SchemaApprovalService with "
+                        "trusted principal authorization, MFA, and verified benchmark results (SCH-005, SEC-003)."
+                    ),
+                    principal_id=approver,
+                    code="FORBIDDEN",
+                )
+
         if not approver or not isinstance(approver, str) or not approver.strip():
             raise ValueError("Approver identity must be a non-empty string.")
 
@@ -277,28 +318,68 @@ class SchemaLifecycleManager:
             version=version,
         )
 
+        # SCH-005 / SEC-003 Four-Eyes author exclusion
+        approver_id = approver.strip()
+        if approver_id == snapshot.author:
+            raise SchemaSelfApprovalError(
+                message=(
+                    f"User '{approver_id}' authored schema '{schema_id}' version {version} "
+                    "and cannot approve it. A second user with the approver role must approve (SCH-005, SEC-003)."
+                ),
+                schema_id=schema_id,
+                version=version,
+                author=snapshot.author,
+            )
+
         now = datetime.now(timezone.utc)
-        updated = self.repository.update_status(schema_id, version, tenant_id, SchemaStatus.APPROVED)
-        self.repository.set_active_version(schema_id, version, tenant_id)
+        resolved_harness_id = harness_run_id or f"internal_{uuid.uuid4().hex[:8]}"
 
-        details: Dict[str, Any] = {"approved_by": approver.strip()}
-        if reason:
-            details["reason"] = reason
-        if harness_run_id:
-            details["harness_run_id"] = harness_run_id
+        if event is None:
+            details: Dict[str, Any] = {
+                "author": snapshot.author,
+                "approved_by": approver_id,
+                "approver": approver_id,
+                "harness_run_id": resolved_harness_id,
+            }
+            if reason:
+                details["reason"] = reason
 
-        self.repository.record_event(
-            LifecycleEvent(
+            event = LifecycleEvent(
                 tenant_id=tenant_id,
                 schema_id=schema_id,
                 version=version,
                 event_type=LifecycleEventType.APPROVED,
-                actor=approver.strip(),
+                actor=approver_id,
                 timestamp=now,
                 from_status=snapshot.status,
                 to_status=SchemaStatus.APPROVED,
                 details=details,
             )
+
+        if approval_record is None:
+            approval_record = SchemaApprovalRecord(
+                tenant_id=tenant_id,
+                schema_id=schema_id,
+                version=version,
+                author_id=snapshot.author,
+                approver_id=approver_id,
+                approval_timestamp=now,
+                harness_run_id=resolved_harness_id,
+                benchmark_policy_version="1.0.0",
+                metric_summary={"source": "internal_promote_to_approved"},
+                reason=reason,
+                lifecycle_event_id=event.event_id,
+            )
+
+        # Atomic promotion and activation through repository
+        updated = self.repository.promote_and_activate(
+            tenant_id=tenant_id,
+            schema_id=schema_id,
+            version=version,
+            approved_by=approver_id,
+            harness_run_id=resolved_harness_id,
+            event=event,
+            approval_record=approval_record,
         )
 
         return updated

@@ -8,20 +8,52 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from schema_lifecycle.enums import SchemaStatus
 from schema_lifecycle.events import LifecycleEvent
 from schema_lifecycle.exceptions import (
+    BenchmarkVerificationError,
+    InvalidStateTransitionError,
     SchemaNotFoundError,
     SchemaVersionError,
     TenantAccessError,
 )
 from schema_lifecycle.metamodel import SchemaDefinition
+
+
+class SchemaApprovalRecord(BaseModel):
+    """
+    Immutable audit record representing an approved schema version (SCH-005, SEC-003).
+    Captures author-approver separation, exact schema version, and passing harness run reference.
+    Contains no extracted document PII.
+    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    approval_id: str = Field(default_factory=lambda: f"appr_{uuid.uuid4().hex[:12]}")
+    tenant_id: str = Field(..., description="Tenant identifier for multi-tenant isolation")
+    schema_id: str = Field(..., description="Schema identifier")
+    version: int = Field(..., ge=1, description="Exact canonical integer schema version")
+    author_id: str = Field(..., description="Identity of schema author")
+    approver_id: str = Field(..., description="Identity of second-user approver holding Schema approver role")
+    approval_timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC approval timestamp",
+    )
+    harness_run_id: str = Field(..., description="Identifier of passing test harness run")
+    benchmark_policy_version: str = Field(default="1.0.0", description="Evaluation policy version applied during benchmark")
+    metric_summary: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="PII-free summary of M1, M6, and calibration metrics",
+    )
+    reason: Optional[str] = Field(default=None, description="Optional sign-off reason or notes")
+    lifecycle_event_id: str = Field(..., description="Reference to append-only LifecycleEvent ID")
+
 
 
 class SchemaSnapshot(BaseModel):
@@ -158,6 +190,52 @@ class SchemaRepository(ABC):
         """Lists all audit events for a schema in a tenant, optionally filtered by version."""
         pass
 
+    @abstractmethod
+    def promote_and_activate(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        approved_by: str,
+        harness_run_id: str,
+        event: LifecycleEvent,
+        approval_record: Optional[SchemaApprovalRecord] = None,
+    ) -> SchemaSnapshot:
+        """
+        Atomically promotes a schema version from TESTING to APPROVED, updates approved_by
+        and harness_run_id on the snapshot, sets active production pointer, records lifecycle event,
+        and persists approval record in a single atomic operation.
+        """
+        pass
+
+    @abstractmethod
+    def get_approval_record(
+        self,
+        schema_id: str,
+        version: int,
+        tenant_id: str,
+    ) -> Optional[SchemaApprovalRecord]:
+        """Retrieves the approval record for a specific approved schema version."""
+        pass
+
+    @abstractmethod
+    def list_approval_records(
+        self,
+        schema_id: str,
+        tenant_id: str,
+    ) -> List[SchemaApprovalRecord]:
+        """Lists all approval records for a schema in a tenant."""
+        pass
+
+    @abstractmethod
+    def is_harness_run_consumed(
+        self,
+        harness_run_id: str,
+        tenant_id: str,
+    ) -> bool:
+        """Checks if a harness run has already been consumed to approve a schema."""
+        pass
+
 
 class InMemorySchemaRepository(SchemaRepository):
     """
@@ -174,6 +252,11 @@ class InMemorySchemaRepository(SchemaRepository):
         self._active_pointers: Dict[Tuple[str, str], int] = {}
         # Append-only list of lifecycle events
         self._events: List[LifecycleEvent] = []
+        # Stored approval records
+        self._approval_records: List[SchemaApprovalRecord] = []
+        # Consumed harness runs: Key (tenant_id, harness_run_id) -> (schema_id, version)
+        self._consumed_harness_runs: Dict[Tuple[str, str], Tuple[str, int]] = {}
+
 
     def _validate_tenant(self, tenant_id: Optional[str]) -> str:
         if not tenant_id or not isinstance(tenant_id, str) or not tenant_id.strip():
@@ -309,3 +392,128 @@ class InMemorySchemaRepository(SchemaRepository):
             if version is not None:
                 matches = [e for e in matches if e.version == version]
             return [copy.deepcopy(e) for e in matches]
+
+    def promote_and_activate(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        approved_by: str,
+        harness_run_id: str,
+        event: LifecycleEvent,
+        approval_record: Optional[SchemaApprovalRecord] = None,
+    ) -> SchemaSnapshot:
+        """
+        Atomically promotes a schema version from TESTING to APPROVED, updates approved_by
+        and harness_run_id on the snapshot, sets active production pointer, records lifecycle event,
+        and persists approval record in a single atomic operation with rollback safety.
+        """
+        tid = self._validate_tenant(tenant_id)
+        key = (tid, schema_id, version)
+
+        with self._lock:
+            existing = self._snapshots.get(key)
+            if existing is None:
+                raise SchemaNotFoundError(
+                    f"Schema '{schema_id}' version {version} not found for tenant '{tid}'.",
+                    schema_id=schema_id,
+                    version=version,
+                    tenant_id=tid,
+                )
+
+            if existing.status != SchemaStatus.TESTING:
+                raise InvalidStateTransitionError(
+                    message=(
+                        f"Schema must be in 'testing' status before it can be approved, "
+                        f"got current status '{existing.status.value}'."
+                    ),
+                    from_status=existing.status,
+                    to_status=SchemaStatus.APPROVED,
+                    schema_id=schema_id,
+                    version=version,
+                )
+
+            # Check if harness_run_id was already consumed for another approval
+            if harness_run_id:
+                consumed_key = (tid, harness_run_id)
+                if consumed_key in self._consumed_harness_runs:
+                    prev_sid, prev_ver = self._consumed_harness_runs[consumed_key]
+                    if (prev_sid, prev_ver) != (schema_id, version):
+                        raise BenchmarkVerificationError(
+                            message=f"Harness run '{harness_run_id}' has already been consumed to approve schema '{prev_sid}' v{prev_ver}.",
+                            harness_run_id=harness_run_id,
+                            schema_id=schema_id,
+                            version=version,
+                        )
+
+            # Snapshot rollback state in memory before mutating
+            orig_snapshot = self._snapshots[key]
+            orig_pointer = self._active_pointers.get((tid, schema_id))
+            orig_events_len = len(self._events)
+            orig_records_len = len(self._approval_records)
+            orig_consumed = dict(self._consumed_harness_runs)
+
+            try:
+                # Update snapshot with status, approved_by, and harness_run_id
+                updated = existing.model_copy(
+                    update={
+                        "status": SchemaStatus.APPROVED,
+                        "approved_by": approved_by,
+                        "harness_run_id": harness_run_id,
+                    }
+                )
+                self._snapshots[key] = copy.deepcopy(updated)
+                self._active_pointers[(tid, schema_id)] = version
+                self._events.append(copy.deepcopy(event))
+                if approval_record is not None:
+                    self._approval_records.append(copy.deepcopy(approval_record))
+                if harness_run_id:
+                    self._consumed_harness_runs[(tid, harness_run_id)] = (schema_id, version)
+
+                return copy.deepcopy(updated)
+            except Exception:
+                # Rollback all state changes if any failure occurs
+                self._snapshots[key] = orig_snapshot
+                if orig_pointer is not None:
+                    self._active_pointers[(tid, schema_id)] = orig_pointer
+                elif (tid, schema_id) in self._active_pointers:
+                    del self._active_pointers[(tid, schema_id)]
+                del self._events[orig_events_len:]
+                del self._approval_records[orig_records_len:]
+                self._consumed_harness_runs = orig_consumed
+                raise
+
+    def get_approval_record(
+        self,
+        schema_id: str,
+        version: int,
+        tenant_id: str,
+    ) -> Optional[SchemaApprovalRecord]:
+        tid = self._validate_tenant(tenant_id)
+        with self._lock:
+            for rec in reversed(self._approval_records):
+                if rec.tenant_id == tid and rec.schema_id == schema_id and rec.version == version:
+                    return copy.deepcopy(rec)
+            return None
+
+    def list_approval_records(
+        self,
+        schema_id: str,
+        tenant_id: str,
+    ) -> List[SchemaApprovalRecord]:
+        tid = self._validate_tenant(tenant_id)
+        with self._lock:
+            return [
+                copy.deepcopy(rec)
+                for rec in self._approval_records
+                if rec.tenant_id == tid and rec.schema_id == schema_id
+            ]
+
+    def is_harness_run_consumed(
+        self,
+        harness_run_id: str,
+        tenant_id: str,
+    ) -> bool:
+        tid = self._validate_tenant(tenant_id)
+        with self._lock:
+            return (tid, harness_run_id) in self._consumed_harness_runs
