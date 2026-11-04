@@ -72,6 +72,64 @@ class ApiKeyRecord(BaseModel):
     last_used_at: Optional[datetime] = Field(None, description="Timestamp when key was last used for authentication")
 
 
+class ApiKeySummary(BaseModel):
+    """Safe, redacted summary of an API key excluding raw secrets and full hashes (SEC-002, SEC-012)."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key_id: str = Field(..., min_length=1, description="Public API key identifier")
+    tenant_id: str = Field(..., min_length=1, description="Bound tenant identifier")
+    name: str = Field(..., min_length=1, description="Descriptive label")
+    key_prefix: str = Field(..., min_length=4, max_length=16, description="Visible key prefix for identification")
+    scopes: List[str] = Field(default_factory=list, description="Granted API scopes")
+    roles: List[str] = Field(default_factory=list, description="Assigned tenant roles")
+    created_at: datetime = Field(..., description="Key generation timestamp")
+    expires_at: Optional[datetime] = Field(None, description="Key expiration timestamp")
+    revoked_at: Optional[datetime] = Field(None, description="Timestamp when revoked, if any")
+    is_active: bool = Field(default=True, description="Active status")
+    created_by: Optional[str] = Field(None, description="Principal ID that created this key")
+    last_used_at: Optional[datetime] = Field(None, description="Timestamp when key was last used")
+
+    @classmethod
+    def from_record(cls, record: ApiKeyRecord) -> "ApiKeySummary":
+        """Factory constructing a sanitized summary strictly omitting key_hash."""
+        return cls(
+            key_id=record.key_id,
+            tenant_id=record.tenant_id,
+            name=record.name,
+            key_prefix=record.key_prefix,
+            scopes=list(record.scopes),
+            roles=list(record.roles),
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+            revoked_at=record.revoked_at,
+            is_active=record.is_active,
+            created_by=record.created_by,
+            last_used_at=record.last_used_at,
+        )
+
+
+class ApiKeyCreationResult(BaseModel):
+    """Result of API key creation exposing the plaintext secret token strictly once."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key_id: str = Field(..., min_length=1, description="Public API key identifier")
+    tenant_id: str = Field(..., min_length=1, description="Bound tenant identifier")
+    name: str = Field(..., min_length=1, description="Descriptive label")
+    key_prefix: str = Field(..., min_length=4, max_length=16, description="Visible key prefix")
+    scopes: List[str] = Field(default_factory=list, description="Granted API scopes")
+    roles: List[str] = Field(default_factory=list, description="Assigned tenant roles")
+    created_at: datetime = Field(..., description="Key generation timestamp")
+    expires_at: Optional[datetime] = Field(None, description="Key expiration timestamp")
+    created_by: Optional[str] = Field(None, description="Principal ID that created this key")
+    raw_secret: str = Field(..., min_length=32, description="Plaintext secret token (disclosed ONCE)")
+
+    def __repr__(self) -> str:
+        return f"<ApiKeyCreationResult key_id={self.key_id!r} prefix={self.key_prefix!r} raw_secret='[REDACTED]'>"
+
+    def __str__(self) -> str:
+        return f"<ApiKeyCreationResult key_id={self.key_id!r} prefix={self.key_prefix!r}>"
+
+
 class WebhookSubscriptionRecord(BaseModel):
     """Tenant webhook event subscription registration."""
     model_config = ConfigDict(extra="forbid")

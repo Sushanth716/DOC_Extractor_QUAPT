@@ -53,13 +53,25 @@ def get_request_id(request: Request) -> str:
 def get_auth_provider(request: Request) -> AuthenticationProvider:
     """Retrieve the registered AuthenticationProvider from application state."""
     provider = getattr(request.app.state, "auth_provider", None)
-    if provider is None:
-        # Default placeholder provider in Phase 0 (concrete API-key provider is TASK-5.7)
-        raise InternalServerError(
-            message="Authentication provider is not configured on the application.",
-            code="AUTH_PROVIDER_UNCONFIGURED",
-        )
-    return provider
+    if provider is not None:
+        return provider
+
+    # If api_key_repo is configured, auto-construct ApiKeyAuthenticationProvider (TASK-5.7-B)
+    api_key_repo = getattr(request.app.state, "api_key_repo", None)
+    if api_key_repo is not None:
+        from doc_extractor.api.ports.audit import SafeStructuredAuditLogger
+        from doc_extractor.api.providers.api_key_auth import ApiKeyAuthenticationProvider
+
+        audit_logger = getattr(request.app.state, "audit_logger", None) or SafeStructuredAuditLogger()
+        provider = ApiKeyAuthenticationProvider(repository=api_key_repo, audit_logger=audit_logger)
+        request.app.state.auth_provider = provider
+        return provider
+
+    # Fail closed: No provider configured and no repository to construct one
+    raise InternalServerError(
+        message="Authentication provider is not configured on the application.",
+        code="AUTH_PROVIDER_UNCONFIGURED",
+    )
 
 
 async def get_current_principal(
@@ -206,3 +218,17 @@ def get_audit_logger(request: Request) -> AuditLogger:
     if logger is None:
         return SafeStructuredAuditLogger()
     return logger
+
+
+def get_api_key_service(
+    request: Request,
+    api_key_repo: ApiKeyRepository = Depends(get_api_key_repository),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
+) -> Any:
+    """Dependency injection provider for ApiKeyService."""
+    service = getattr(request.app.state, "api_key_service", None)
+    if service is not None:
+        return service
+    from doc_extractor.api.services.api_key_service import ApiKeyService
+
+    return ApiKeyService(repository=api_key_repo, audit_logger=audit_logger)
