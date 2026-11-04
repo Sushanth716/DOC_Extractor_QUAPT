@@ -54,13 +54,13 @@ class ReviewTaskRecord(BaseModel):
 
 
 class ApiKeyRecord(BaseModel):
-    """API key credential and authorization scope record."""
+    """API key credential and authorization scope record with deterministic SHA-256 hash (SEC-002)."""
     model_config = ConfigDict(extra="forbid")
 
     key_id: str = Field(..., min_length=1, description="Public API key identifier (prefix)")
     tenant_id: str = Field(..., min_length=1, description="Bound tenant identifier")
     name: str = Field(..., min_length=1, description="Descriptive label for the API key")
-    key_hash: str = Field(..., min_length=32, description="Salted cryptographic hash of secret token")
+    key_hash: str = Field(..., min_length=64, max_length=64, description="Cryptographic SHA-256 hash of secret token")
     key_prefix: str = Field(..., min_length=4, max_length=16, description="Visible key prefix for identification")
     scopes: List[str] = Field(default_factory=list, description="Granted API scopes/permissions")
     roles: List[str] = Field(default_factory=list, description="Canonical roles assigned to the API key")
@@ -69,6 +69,7 @@ class ApiKeyRecord(BaseModel):
     revoked_at: Optional[datetime] = Field(None, description="Timestamp when key was revoked, if any")
     is_active: bool = Field(default=True, description="Whether key is currently active")
     created_by: Optional[str] = Field(None, description="Principal ID that created this key")
+    last_used_at: Optional[datetime] = Field(None, description="Timestamp when key was last used for authentication")
 
 
 class WebhookSubscriptionRecord(BaseModel):

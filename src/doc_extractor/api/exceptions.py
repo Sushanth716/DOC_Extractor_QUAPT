@@ -72,6 +72,32 @@ class AuthenticationRequiredError(ApiHttpError):
         super().__init__(message=message, code=code, status_code=401, request_id=request_id, details=details)
 
 
+class InvalidTokenError(AuthenticationRequiredError):
+    """Raised when an API key token is malformed, invalid, or fails verification (HTTP 401)."""
+
+    def __init__(
+        self,
+        message: str = "Invalid API key token.",
+        code: str = "INVALID_CREDENTIALS",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
+class TokenExpiredError(AuthenticationRequiredError):
+    """Raised when an API key token has expired per SEC-002 (HTTP 401)."""
+
+    def __init__(
+        self,
+        message: str = "API key token has expired.",
+        code: str = "TOKEN_EXPIRED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
 class ForbiddenError(ApiHttpError):
     """Raised when caller lacks required authorization scopes or roles (HTTP 403)."""
 
@@ -85,6 +111,19 @@ class ForbiddenError(ApiHttpError):
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message=message, code=code, status_code=403, request_id=request_id, details=details)
+
+
+class PrivilegedRoleNotAllowedError(ForbiddenError):
+    """Raised when attempting to issue an ordinary API key with privileged roles (HTTP 403)."""
+
+    def __init__(
+        self,
+        message: str = "Privileged roles (admin, schema_approver) cannot be assigned to API keys.",
+        code: str = "PRIVILEGED_ROLE_NOT_ALLOWED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
 
 
 class TenantAccessDeniedError(ForbiddenError):
@@ -192,6 +231,32 @@ class ApiValidationError(ApiHttpError):
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message=message, code=code, status_code=422, request_id=request_id, details=details)
+
+
+class InvalidKeyExpirationError(ApiValidationError):
+    """Raised when requested API key expiration exceeds policy or is invalid (HTTP 422)."""
+
+    def __init__(
+        self,
+        message: str = "API key expiration exceeds maximum allowed lifetime of 90 days.",
+        code: str = "INVALID_KEY_EXPIRATION",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
+class InvalidScopeError(ApiValidationError):
+    """Raised when requested API key scope is forbidden or invalid (HTTP 422)."""
+
+    def __init__(
+        self,
+        message: str = "Requested API key scope is invalid or forbidden.",
+        code: str = "INVALID_SCOPE",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
 
 
 class InternalServerError(ApiHttpError):

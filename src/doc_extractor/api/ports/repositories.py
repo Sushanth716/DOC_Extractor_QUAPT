@@ -128,6 +128,15 @@ class ApiKeyRepository(Protocol):
         """List all API keys belonging to the tenant."""
         ...
 
+    async def record_last_used(
+        self,
+        tenant_id: str,
+        key_id: str,
+        last_used_at: datetime,
+    ) -> bool:
+        """Record or update the last-used timestamp for an active API key."""
+        ...
+
 
 @runtime_checkable
 class WebhookSubscriptionRepository(Protocol):

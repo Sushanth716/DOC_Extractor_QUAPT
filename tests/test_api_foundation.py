@@ -837,6 +837,7 @@ class MockApiKeyRepo:
     async def create(self, tenant_id: str, key_record: ApiKeyRecord) -> ApiKeyRecord: return key_record
     async def revoke(self, tenant_id: str, key_id: str) -> bool: return True
     async def list_keys(self, tenant_id: str, limit: int = 50, offset: int = 0) -> List[ApiKeyRecord]: return []
+    async def record_last_used(self, tenant_id: str, key_id: str, last_used_at: datetime) -> bool: return True
 
 
 class MockWebhookSubRepo:
